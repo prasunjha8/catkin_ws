@@ -1,0 +1,228 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="two_wheel_bike">
+
+  <!-- Constants -->
+  <xacro:property name="PI" value="3.1415926535897931"/>
+  <xacro:property name="chassis_mass" value="15.0"/>
+  <xacro:property name="wheel_mass" value="1.5"/>
+  <xacro:property name="fork_mass" value="2.0"/>
+  <xacro:property name="wheel_radius" value="0.3"/>
+  <xacro:property name="wheel_width" value="0.08"/>
+  <xacro:property name="chassis_length" value="1.2"/>
+  <xacro:property name="chassis_height" value="0.4"/>
+  <xacro:property name="chassis_width" value="0.1"/>
+  <xacro:property name="fork_length" value="0.5"/>
+  <xacro:property name="caster_angle" value="${PI/12}"/> <!-- 15 degrees -->
+
+  <!-- Base Link (Chassis) -->
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 ${wheel_radius + chassis_height/2}" rpy="0 0 0"/>
+      <geometry>
+        <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
+      </geometry>
+      <material name="blue">
+        <color rgba="0.2 0.2 1.0 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${wheel_radius + chassis_height/2}" rpy="0 0 0"/>
+      <geometry>
+        <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="${chassis_mass}"/>
+      <inertia ixx="${chassis_mass*(chassis_width*chassis_width+chassis_height*chassis_height)/12}" 
+               ixy="0" ixz="0" 
+               iyy="${chassis_mass*(chassis_length*chassis_length+chassis_height*chassis_height)/12}" 
+               iyz="0" 
+               izz="${chassis_mass*(chassis_length*chassis_length+chassis_width*chassis_width)/12}"/>
+    </inertial>
+  </link>
+
+  <!-- Rear Wheel -->
+  <link name="rear_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="${PI/2} 0 0"/>
+      <geometry>
+        <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+      </geometry>
+      <material name="black">
+        <color rgba="0.1 0.1 0.1 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="${PI/2} 0 0"/>
+      <geometry>
+        <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="${wheel_mass}"/>
+      <inertia ixx="${wheel_mass*(3*wheel_radius*wheel_radius+wheel_width*wheel_width)/12}" 
+               ixy="0" ixz="0" 
+               iyy="${wheel_mass*(3*wheel_radius*wheel_radius+wheel_width*wheel_width)/12}" 
+               iyz="0" 
+               izz="${wheel_mass*wheel_radius*wheel_radius/2}"/>
+    </inertial>
+  </link>
+
+  <joint name="rear_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="rear_wheel_link"/>
+    <origin xyz="-${chassis_length/2} 0 ${wheel_radius}" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <dynamics damping="0.1" friction="0.1"/>
+  </joint>
+
+  <!-- Steering (Front Fork) -->
+  <link name="front_fork_link">
+    <visual>
+        <origin xyz="${fork_length*sin(caster_angle)/2} 0 -${fork_length*cos(caster_angle)/2}" rpy="0 ${caster_angle} 0"/>
+        <geometry>
+            <box size="0.05 0.05 ${fork_length}"/>
+        </geometry>
+        <material name="grey">
+            <color rgba="0.5 0.5 0.5 1.0"/>
+        </material>
+    </visual>
+    <collision>
+        <origin xyz="${fork_length*sin(caster_angle)/2} 0 -${fork_length*cos(caster_angle)/2}" rpy="0 ${caster_angle} 0"/>
+        <geometry>
+            <box size="0.05 0.05 ${fork_length}"/>
+        </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="${fork_mass}"/>
+      <inertia ixx="${fork_mass*(0.05*0.05+fork_length*fork_length)/12}" 
+               ixy="0" ixz="0" 
+               iyy="${fork_mass*(0.05*0.05+fork_length*fork_length)/12}" 
+               iyz="0" 
+               izz="${fork_mass*(0.05*0.05+0.05*0.05)/12}"/>
+    </inertial>
+  </link>
+
+  <joint name="steering_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="front_fork_link"/>
+    <origin xyz="${chassis_length/2} 0 ${wheel_radius + chassis_height/2}" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.785" upper="0.785" effort="10" velocity="10"/>
+    <dynamics damping="0.1" friction="0.1"/>
+  </joint>
+
+  <!-- Front Wheel -->
+  <link name="front_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="${PI/2} 0 0"/>
+      <geometry>
+        <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+      </geometry>
+      <material name="black">
+        <color rgba="0.1 0.1 0.1 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="${PI/2} 0 0"/>
+      <geometry>
+        <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="${wheel_mass}"/>
+      <inertia ixx="${wheel_mass*(3*wheel_radius*wheel_radius+wheel_width*wheel_width)/12}" 
+               ixy="0" ixz="0" 
+               iyy="${wheel_mass*(3*wheel_radius*wheel_radius+wheel_width*wheel_width)/12}" 
+               iyz="0" 
+               izz="${wheel_mass*wheel_radius*wheel_radius/2}"/>
+    </inertial>
+  </link>
+
+  <joint name="front_wheel_joint" type="continuous">
+    <parent link="front_fork_link"/>
+    <child link="front_wheel_link"/>
+    <origin xyz="${fork_length*sin(caster_angle)} 0 -${fork_length*cos(caster_angle)}" rpy="0 ${caster_angle} 0"/>
+    <axis xyz="0 1 0"/>
+    <dynamics damping="0.1" friction="0.1"/>
+  </joint>
+
+  <!-- Gazebo-specific link properties -->
+  <gazebo reference="base_link">
+    <material>Gazebo/Blue</material>
+    <mu1>0.2</mu1>
+    <mu2>0.2</mu2>
+  </gazebo>
+
+  <gazebo reference="rear_wheel_link">
+    <material>Gazebo/Black</material>
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+  </gazebo>
+
+  <gazebo reference="front_wheel_link">
+    <material>Gazebo/Black</material>
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+  </gazebo>
+
+  <gazebo reference="front_fork_link">
+    <material>Gazebo/Grey</material>
+    <mu1>0.2</mu1>
+    <mu2>0.2</mu2>
+  </gazebo>
+
+  <!-- IMU Sensor with proper parameters -->
+  <gazebo reference="base_link">
+    <sensor name="imu_sensor" type="imu">
+      <always_on>true</always_on>
+      <update_rate>100</update_rate>
+      <visualize>true</visualize>
+      <topic>imu</topic>
+      <plugin filename="libgazebo_ros_imu_sensor.so" name="imu_plugin">
+        <topicName>imu</topicName>
+        <bodyName>base_link</bodyName>
+        <updateRateHZ>100.0</updateRateHZ>
+        <gaussianNoise>0.0</gaussianNoise>
+        <xyzOffset>0 0 0</xyzOffset>
+        <rpyOffset>0 0 0</rpyOffset>
+        <frameName>base_link</frameName>
+        <initialOrientationAsReference>false</initialOrientationAsReference>
+      </plugin>
+    </sensor>
+  </gazebo>
+  
+  <!-- Differential Drive Plugin -->
+  <gazebo>
+    <plugin name="differential_drive_controller" filename="libgazebo_ros_diff_drive.so">
+        <robotNamespace>/</robotNamespace>
+        
+        <!-- Map rear wheel to left_joint and steering to right_joint -->
+        <leftJoint>rear_wheel_joint</leftJoint>
+        <rightJoint>steering_joint</rightJoint>
+
+        <wheelSeparation>1.0</wheelSeparation>
+        <wheelDiameter>${2*wheel_radius}</wheelDiameter>
+        
+        <maxWheelTorque>20</maxWheelTorque>
+        <maxWheelAcceleration>1.0</maxWheelAcceleration>
+
+        <commandTopic>cmd_vel</commandTopic>
+        <odometryTopic>odom</odometryTopic>
+        <odometryFrame>odom</odometryFrame>
+        <robotBaseFrame>base_link</robotBaseFrame>
+
+        <publishOdom>true</publishOdom>
+        <publishOdomTF>true</publishOdomTF>
+        <publishWheelTF>false</publishWheelTF>
+
+        <updateRate>30</updateRate>
+        <legacyMode>true</legacyMode>
+    </plugin>
+  </gazebo>
+
+</robot>
