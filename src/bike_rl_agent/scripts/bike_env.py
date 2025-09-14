@@ -4,10 +4,9 @@ import gym
 from gym import spaces
 import numpy as np
 import rospy
-import rosservice
 from std_msgs.msg import Float64
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, JointState
 from gazebo_msgs.msg import ModelStates
 from std_srvs.srv import Empty
 import tf.transformations as tft
@@ -15,30 +14,32 @@ import math
 import time
 import threading
 
-class BikeEnv(gym.Env):
-    """Custom OpenAI Gym environment for the self-balancing bike in Gazebo."""
+class MotorcycleEnv(gym.Env):
+    """Realistic motorcycle environment with proper bike physics"""
     metadata = {'render.modes': ['human']}
 
     def __init__(self):
-        super(BikeEnv, self).__init__()
+        super(MotorcycleEnv, self).__init__()
         
-        # Initialize ROS node if not already initialized
         if not rospy.get_node_uri():
-            rospy.init_node('bike_env', anonymous=True)
+            rospy.init_node('motorcycle_env', anonymous=True)
         
-        rospy.loginfo("Initializing BikeEnv...")
+        rospy.loginfo("Initializing Realistic MotorcycleEnv...")
 
-        # Action and Observation Space
+        # Action space: [throttle, steering_angle]
+        # Throttle: -1 (full brake/reverse) to +1 (full throttle)
+        # Steering: -1 (full left) to +1 (full right)
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(16,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(18,), dtype=np.float32)
 
-        # ROS Publishers
+        # Publishers for motorcycle control
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+        self.steering_pub = rospy.Publisher('/steering_controller/command', Float64, queue_size=1)
         
         # Thread safety
         self._data_lock = threading.Lock()
         
-        # Initialize ALL state variables BEFORE setting up subscribers
+        # State variables
         self.roll = 0.0
         self.pitch = 0.0
         self.yaw = 0.0
@@ -48,124 +49,57 @@ class BikeEnv(gym.Env):
         
         self.bike_pose = None
         self.bike_twist = None
-        self.bike_model_index = -1  # This MUST be initialized before subscribers
+        self.bike_model_index = -1
         
+        # Control state
+        self.throttle = 0.0
         self.steering_angle = 0.0
-        self.rear_wheel_vel = 0.0
-
-        # Target and episode parameters
-        self.target_pos = np.array([10.0, 0.0])
-        self.prev_distance_to_goal = 10.0
+        self.current_speed = 0.0
+        self.wheel_angular_velocity = 0.0
+        
+        # Physics parameters
+        self.min_stable_speed = 2.0  # m/s - minimum speed for stability
+        self.max_speed = 15.0        # m/s - maximum speed
+        self.wheelbase = 1.4         # m - distance between wheels
+        
+        # Episode management
+        self.target_pos = np.array([20.0, 0.0])  # Further target for motorcycle
+        self.prev_distance_to_goal = 20.0
         self.step_count = 0
-        self.max_steps = 1000
-
-        # Setup with timeouts
-        self._setup_with_retry()
+        self.max_steps = 3000  # Longer episodes for motorcycle
+        self.episode_count = 0
         
-        rospy.loginfo("BikeEnv initialized successfully.")
+        # Motorcycle physics constants
+        self.gravity = 9.81
+        self.bike_height = 0.7  # Center of mass height
+        
+        self._setup_ros_connections()
+        rospy.loginfo("Realistic MotorcycleEnv initialized successfully.")
 
-    def _setup_with_retry(self, max_retries=3):
-        """Setup ROS connections with retry logic"""
-        for attempt in range(max_retries):
-            try:
-                rospy.loginfo(f"Setup attempt {attempt + 1}/{max_retries}")
-                
-                # Check if ROS master is running
-                if not self._check_ros_master():
-                    rospy.logwarn("ROS master not responding")
-                    time.sleep(2)
-                    continue
-                
-                # Setup Gazebo services with timeout
-                if not self._setup_gazebo_services_with_timeout():
-                    rospy.logwarn("Failed to connect to Gazebo services")
-                    time.sleep(2)
-                    continue
-                
-                # Setup subscribers
-                self._setup_subscribers()
-                
-                # Wait for initial data with timeout
-                if not self._wait_for_initial_data_with_timeout():
-                    rospy.logwarn("No initial sensor data received, but continuing...")
-                
-                return  # Success
-                
-            except Exception as e:
-                rospy.logwarn(f"Setup attempt {attempt + 1} failed: {e}")
-                if attempt == max_retries - 1:
-                    rospy.logwarn("All setup attempts failed. Environment may not work correctly.")
-                else:
-                    time.sleep(2)
-
-    def _check_ros_master(self):
-        """Check if ROS master is running"""
+    def _setup_ros_connections(self):
+        """Setup ROS connections for motorcycle"""
         try:
-            rospy.get_master().getSystemState()
-            return True
-        except:
-            return False
-
-    def _setup_gazebo_services_with_timeout(self, timeout=10):
-        """Setup Gazebo services with timeout"""
-        services = [
-            '/gazebo/reset_simulation',
-            '/gazebo/unpause_physics', 
-            '/gazebo/pause_physics'
-        ]
-        
-        for service_name in services:
-            try:
-                rospy.loginfo(f"Waiting for service: {service_name}")
-                rospy.wait_for_service(service_name, timeout=timeout)
-            except rospy.ROSException:
-                rospy.logwarn(f"Service {service_name} not available after {timeout}s")
-                return False
-        
-        try:
+            # Wait for Gazebo services
+            rospy.wait_for_service('/gazebo/reset_simulation', timeout=10)
+            rospy.wait_for_service('/gazebo/unpause_physics', timeout=10)
+            rospy.wait_for_service('/gazebo/pause_physics', timeout=10)
+            
             self.reset_simulation_proxy = rospy.ServiceProxy('/gazebo/reset_simulation', Empty)
             self.unpause_proxy = rospy.ServiceProxy('/gazebo/unpause_physics', Empty)
             self.pause_proxy = rospy.ServiceProxy('/gazebo/pause_physics', Empty)
-            rospy.loginfo("Gazebo services connected successfully.")
-            return True
+            
+            # Subscribe to sensors
+            rospy.Subscriber('/imu', Imu, self._imu_callback, queue_size=1)
+            rospy.Subscriber('/gazebo/model_states', ModelStates, self._model_states_callback, queue_size=1)
+            rospy.Subscriber('/joint_states', JointState, self._joint_states_callback, queue_size=1)
+            
+            rospy.loginfo("Motorcycle ROS connections established.")
+            
         except Exception as e:
-            rospy.logwarn(f"Failed to create service proxies: {e}")
-            return False
-
-    def _setup_subscribers(self):
-        """Setup ROS subscribers"""
-        rospy.Subscriber('/imu', Imu, self._imu_callback, queue_size=1)
-        rospy.Subscriber('/gazebo/model_states', ModelStates, self._model_states_callback, queue_size=1)
-
-    def _wait_for_initial_data_with_timeout(self, timeout=15):
-        """Wait for initial sensor data with timeout"""
-        rospy.loginfo("Waiting for initial sensor data...")
-        start_time = time.time()
-        
-        # First, check if topics exist
-        topics = rospy.get_published_topics()
-        topic_names = [topic[0] for topic in topics]
-        
-        if '/imu' not in topic_names:
-            rospy.logwarn("IMU topic not found in published topics")
-        if '/gazebo/model_states' not in topic_names:
-            rospy.logwarn("Model states topic not found in published topics")
-        
-        # Wait for data
-        while (time.time() - start_time) < timeout and not rospy.is_shutdown():
-            with self._data_lock:
-                if self.bike_pose is not None and self.bike_twist is not None:
-                    rospy.loginfo("Initial sensor data received.")
-                    return True
-            time.sleep(0.1)
-        
-        rospy.logwarn(f"No initial sensor data after {timeout}s. Available topics:")
-        for topic in topic_names[:10]:  # Show first 10 topics
-            rospy.logwarn(f"  {topic}")
-        return False
+            rospy.logerr(f"Failed to setup ROS connections: {e}")
+            raise
 
     def _imu_callback(self, data):
-        """IMU callback with error handling"""
         try:
             with self._data_lock:
                 orientation_q = data.orientation
@@ -179,68 +113,82 @@ class BikeEnv(gym.Env):
             rospy.logwarn_once(f"IMU callback error: {e}")
 
     def _model_states_callback(self, data):
-        """Model states callback with error handling"""
         try:
             with self._data_lock:
                 if self.bike_model_index == -1:
-                    # Look for bike model
-                    possible_names = ['two_wheel_bike', 'bike', 'robot']
+                    possible_names = ['two_wheel_bike', 'motorcycle', 'bike']
                     for name in possible_names:
                         try:
                             self.bike_model_index = data.name.index(name)
-                            rospy.loginfo(f"Found bike model: {name} at index {self.bike_model_index}")
                             break
                         except ValueError:
                             continue
-                    
-                    if self.bike_model_index == -1:
-                        rospy.logwarn_once(f"Bike model not found. Available models: {data.name}")
-                        return
                 
-                if (self.bike_model_index < len(data.pose) and 
+                if (self.bike_model_index >= 0 and 
+                    self.bike_model_index < len(data.pose) and 
                     self.bike_model_index < len(data.twist)):
                     self.bike_pose = data.pose[self.bike_model_index]
                     self.bike_twist = data.twist[self.bike_model_index]
+                    self.current_speed = math.sqrt(
+                        self.bike_twist.linear.x**2 + 
+                        self.bike_twist.linear.y**2
+                    )
         except Exception as e:
             rospy.logwarn_once(f"Model states callback error: {e}")
 
+    def _joint_states_callback(self, data):
+        """Get joint states for wheel and steering information"""
+        try:
+            with self._data_lock:
+                if 'rear_wheel_joint' in data.name:
+                    idx = data.name.index('rear_wheel_joint')
+                    self.wheel_angular_velocity = data.velocity[idx]
+                
+                if 'steering_joint' in data.name:
+                    idx = data.name.index('steering_joint')
+                    self.steering_angle = data.position[idx]
+        except Exception as e:
+            rospy.logwarn_once(f"Joint states callback error: {e}")
+
     def _get_obs(self):
-        """Get observation with fallback for missing data"""
+        """Get motorcycle observation with physics-based features"""
         with self._data_lock:
-            # Use default values if data not available
             if self.bike_pose is None:
-                # Create default pose
-                from geometry_msgs.msg import Pose, Point, Quaternion
+                from geometry_msgs.msg import Pose, Point, Quaternion, Twist, Vector3
                 self.bike_pose = Pose()
-                self.bike_pose.position = Point(0, 0, 0.4)
+                self.bike_pose.position = Point(0, 0, 0.5)
                 self.bike_pose.orientation = Quaternion(0, 0, 0, 1)
-            
+                
             if self.bike_twist is None:
-                # Create default twist
-                from geometry_msgs.msg import Twist, Vector3
                 self.bike_twist = Twist()
                 self.bike_twist.linear = Vector3(0, 0, 0)
                 self.bike_twist.angular = Vector3(0, 0, 0)
 
-            # 1. IMU Data (6)
-            imu_data = [self.roll, self.pitch, self.yaw, 
-                       self.roll_rate, self.pitch_rate, self.yaw_rate]
+            # Core motorcycle state (6)
+            orientation_data = [self.roll, self.pitch, self.yaw, 
+                               self.roll_rate, self.pitch_rate, self.yaw_rate]
             
-            # 2. Body Velocities (6)
-            body_vel = [
+            # Velocity state (6)
+            velocity_data = [
                 self.bike_twist.linear.x, self.bike_twist.linear.y, self.bike_twist.linear.z,
                 self.bike_twist.angular.x, self.bike_twist.angular.y, self.bike_twist.angular.z
             ]
 
-            # 3. Joint States (2)
-            joint_states = [self.steering_angle, self.rear_wheel_vel]
+            # Control state (2)
+            control_data = [self.throttle, self.steering_angle]
 
-            # 4. Target Information (2)
+            # Motorcycle-specific physics (2)
+            physics_data = [
+                self.current_speed,
+                self.wheel_angular_velocity
+            ]
+
+            # Target navigation (2) 
             current_pos = np.array([self.bike_pose.position.x, self.bike_pose.position.y])
             vector_to_goal = self.target_pos - current_pos
             distance_to_goal = np.linalg.norm(vector_to_goal)
             
-            if distance_to_goal > 0.001:  # Avoid division by zero
+            if distance_to_goal > 0.001:
                 angle_to_goal = math.atan2(vector_to_goal[1], vector_to_goal[0])
                 bearing = angle_to_goal - self.yaw
                 # Normalize bearing
@@ -251,127 +199,209 @@ class BikeEnv(gym.Env):
             else:
                 bearing = 0.0
                 
-            target_info = [distance_to_goal, bearing]
+            target_data = [distance_to_goal, bearing]
 
-            # Combine all observations
-            obs = np.array(imu_data + body_vel + joint_states + target_info, dtype=np.float32)
-            obs = np.clip(obs, -100, 100)  # Prevent extreme values
+            obs = np.array(orientation_data + velocity_data + control_data + 
+                          physics_data + target_data, dtype=np.float32)
+            obs = np.clip(obs, -100, 100)
             
             return obs
 
     def step(self, action):
-        """Environment step with error handling"""
+        """Motorcycle physics step"""
         try:
+            # Clip and process actions
+            action = np.clip(action, -1, 1)
+            target_throttle = action[0]
+            target_steering = action[1] * 0.5  # ±28.6 degrees max steering
+            
             # Unpause physics
             try:
                 self.unpause_proxy()
             except:
-                rospy.logwarn_once("Failed to unpause physics")
+                pass
 
-            # Process action
-            self.rear_wheel_vel = float(np.clip(action[0], -1, 1)) * 5.0
-            self.steering_angle = float(np.clip(action[1], -1, 1)) * 0.52
-
-            # Send command
+            # Apply motorcycle control
+            self.throttle = target_throttle
+            
+            # Map throttle to velocity command (motorcycle style)
+            if self.throttle > 0:
+                # Forward throttle
+                target_velocity = self.throttle * self.max_speed
+            else:
+                # Braking/reverse
+                target_velocity = self.throttle * 5.0  # Slower reverse
+            
+            # Send drive command
             cmd = Twist()
-            cmd.linear.x = self.rear_wheel_vel
-            cmd.angular.z = self.steering_angle
+            cmd.linear.x = target_velocity
+            cmd.angular.z = 0.0  # Don't use angular.z for steering
             self.cmd_vel_pub.publish(cmd)
             
-            # Wait for simulation
-            time.sleep(0.1)
-
+            # Send steering command
+            steering_cmd = Float64()
+            steering_cmd.data = target_steering
+            self.steering_pub.publish(steering_cmd)
+            
+            # Simulation timestep
+            time.sleep(0.02)  # 50 Hz control
+            
             # Pause physics
             try:
                 self.pause_proxy()
             except:
-                rospy.logwarn_once("Failed to pause physics")
+                pass
 
             self.step_count += 1
             
             # Get observation and compute reward
             obs = self._get_obs()
-            reward = self._compute_reward(obs)
-            done = False
-
-            # Check termination conditions
-            if abs(self.roll) > 1.0:  # Fallen over
-                done = True
-                reward = -100.0
-            elif len(obs) >= 15 and obs[14] < 1.0:  # Reached goal
-                done = True
-                reward += 100.0
-            elif self.step_count >= self.max_steps:
-                done = True
-
-            # Small reward for staying alive
-            if not done:
-                reward += 1.0
-
-            return obs, float(reward), done, {}
+            reward = self._compute_motorcycle_reward(obs, action)
+            done = self._check_motorcycle_termination(obs)
+            
+            return obs, float(reward), done, self._get_info()
 
         except Exception as e:
             rospy.logwarn(f"Step error: {e}")
-            # Return safe defaults
             obs = self._get_obs()
-            return obs, -1.0, True, {}
+            return obs, -10.0, False, {}
 
-    def _compute_reward(self, obs):
-        """Simple reward function"""
+    def _compute_motorcycle_reward(self, obs, action):
+        """Reward function based on motorcycle physics"""
         try:
-            if len(obs) < 15:
-                return 0.0
-                
-            # Balance reward
-            balance_reward = math.exp(-5.0 * abs(self.roll))
+            # Speed-dependent stability reward
+            if self.current_speed < self.min_stable_speed:
+                # Penalty for being too slow (unstable)
+                speed_reward = -20.0 + (self.current_speed / self.min_stable_speed) * 20.0
+            else:
+                # Reward for good speed
+                speed_reward = 10.0 - abs(self.current_speed - 8.0)  # Optimal ~8 m/s
             
-            # Forward motion
-            forward_vel = obs[6] if len(obs) > 6 else 0.0
-            forward_reward = max(0, forward_vel) * 0.5
+            # Dynamic stability reward (most important)
+            if self.current_speed > 1.0:
+                # At speed, use gyroscopic stability model
+                stability_factor = min(self.current_speed / self.min_stable_speed, 2.0)
+                balance_reward = 30.0 * stability_factor * math.exp(-5.0 * abs(self.roll))
+            else:
+                # At low speed, heavily penalize tilt
+                balance_reward = -50.0 * abs(self.roll)
             
-            # Progress toward goal
-            current_distance = obs[14]
-            progress_reward = (self.prev_distance_to_goal - current_distance) * 10.0
-            self.prev_distance_to_goal = current_distance
+            # Forward progress reward
+            forward_velocity = obs[6] if len(obs) > 6 else 0.0
+            progress_reward = 5.0 if forward_velocity > 2.0 else -5.0
             
-            return balance_reward + forward_reward + progress_reward
+            # Smooth control reward
+            smoothness_penalty = -2.0 * (abs(action[0]) + abs(action[1]))
+            
+            # Navigation reward
+            navigation_reward = 0.0
+            if len(obs) > 17:
+                current_distance = obs[16]  # distance to goal
+                progress = self.prev_distance_to_goal - current_distance
+                navigation_reward = 5.0 * progress
+                self.prev_distance_to_goal = current_distance
+            
+            # Steering physics reward (counter-steering at speed)
+            steering_reward = 0.0
+            if self.current_speed > 5.0 and abs(self.roll) > 0.1:
+                # Reward appropriate counter-steering
+                expected_steering = -np.sign(self.roll) * min(abs(self.roll), 0.3)
+                steering_error = abs(self.steering_angle - expected_steering)
+                steering_reward = -5.0 * steering_error
+            
+            total_reward = (speed_reward + balance_reward + progress_reward + 
+                          smoothness_penalty + navigation_reward + steering_reward)
+            
+            return total_reward
             
         except Exception as e:
             rospy.logwarn_once(f"Reward computation error: {e}")
             return 0.0
 
+    def _check_motorcycle_termination(self, obs):
+        """Motorcycle-specific termination conditions"""
+        
+        # Don't terminate too early
+        if self.step_count < 100:
+            return False
+        
+        # Crashed (fallen over)
+        if abs(self.roll) > 1.4:  # About 80 degrees
+            self.episode_count += 1
+            rospy.loginfo(f"Episode {self.episode_count}: Motorcycle crashed! Roll: {self.roll:.2f}")
+            return True
+        
+        # Lost control (spinning)
+        if abs(self.yaw_rate) > 3.0 and self.current_speed < 1.0:
+            rospy.loginfo(f"Episode {self.episode_count}: Lost control!")
+            return True
+            
+        # Goal reached
+        if len(obs) > 16 and obs[16] < 2.0:  # Within 2m of goal
+            self.episode_count += 1
+            rospy.loginfo(f"Episode {self.episode_count}: Goal reached! Steps: {self.step_count}")
+            return True
+            
+        # Max steps
+        if self.step_count >= self.max_steps:
+            self.episode_count += 1
+            rospy.loginfo(f"Episode {self.episode_count}: Timeout after {self.step_count} steps")
+            return True
+            
+        return False
+
+    def _get_info(self):
+        return {
+            'episode_count': self.episode_count,
+            'step_count': self.step_count,
+            'speed': self.current_speed,
+            'roll': self.roll,
+            'steering': self.steering_angle
+        }
+
     def reset(self):
-        """Reset environment with error handling"""
+        """Reset motorcycle to starting position"""
         try:
-            rospy.loginfo("Resetting environment...")
+            rospy.loginfo("Resetting motorcycle...")
             
-            # Reset simulation
-            try:
-                self.reset_simulation_proxy()
-                time.sleep(1.0)  # Wait for reset
-            except:
-                rospy.logwarn("Failed to reset simulation")
+            # Reset simulation every few episodes
+            if self.episode_count % 3 == 0:
+                try:
+                    self.reset_simulation_proxy()
+                    time.sleep(2.0)
+                except:
+                    pass
             
-            # Reset internal state
+            # Reset control state
             self.step_count = 0
+            self.throttle = 0.0
             self.steering_angle = 0.0
-            self.rear_wheel_vel = 0.0
+            self.current_speed = 0.0
             
-            # Stop the robot
+            # Stop motorcycle
             cmd = Twist()
             self.cmd_vel_pub.publish(cmd)
             
-            # Unpause briefly to get fresh data
+            steering_cmd = Float64()
+            steering_cmd.data = 0.0
+            self.steering_pub.publish(steering_cmd)
+            
+            # Give small initial forward velocity for stability
+            time.sleep(0.5)
+            initial_cmd = Twist()
+            initial_cmd.linear.x = 3.0  # Start with some forward speed
+            self.cmd_vel_pub.publish(initial_cmd)
+            
+            # Brief unpause to initialize
             try:
                 self.unpause_proxy()
-                time.sleep(0.2)
+                time.sleep(0.5)
                 self.pause_proxy()
             except:
                 pass
             
-            # Get fresh observation
             obs = self._get_obs()
-            self.prev_distance_to_goal = obs[14] if len(obs) >= 15 else 10.0
+            self.prev_distance_to_goal = obs[16] if len(obs) > 16 else 20.0
             
             return obs
             
@@ -380,25 +410,34 @@ class BikeEnv(gym.Env):
             return self._get_obs()
 
     def close(self):
-        """Clean shutdown"""
-        rospy.loginfo("Closing BikeEnv...")
+        rospy.loginfo("Closing MotorcycleEnv...")
         try:
+            # Stop motorcycle
             cmd = Twist()
             self.cmd_vel_pub.publish(cmd)
+            
+            steering_cmd = Float64()
+            steering_cmd.data = 0.0
+            self.steering_pub.publish(steering_cmd)
         except:
             pass
 
 if __name__ == '__main__':
-    # Test the environment
     try:
-        env = BikeEnv()
+        env = MotorcycleEnv()
         obs = env.reset()
-        rospy.loginfo("Environment test successful!")
+        rospy.loginfo("Testing realistic motorcycle environment...")
         
-        for i in range(5):
-            action = env.action_space.sample()
+        for i in range(20):
+            # Test realistic motorcycle actions
+            throttle = 0.6 if i < 10 else 0.3  # Accelerate then cruise
+            steering = 0.1 * math.sin(i * 0.2)  # Gentle weaving
+            action = np.array([throttle, steering])
+            
             obs, reward, done, info = env.step(action)
-            rospy.loginfo(f"Step {i}: Reward={reward:.2f}, Done={done}")
+            rospy.loginfo(f"Step {i}: Speed={info.get('speed', 0):.1f}m/s, "
+                         f"Roll={info.get('roll', 0):.3f}, Reward={reward:.1f}")
+            
             if done:
                 obs = env.reset()
                 
